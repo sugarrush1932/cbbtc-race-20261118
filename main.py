@@ -1,58 +1,73 @@
-"""Washout-and-Reclaim: a selective cbBTC bot for bars-replay/v1.
+"""Auction-and-Engulf: a cbBTC bot for bars-replay/v1 built on price
+auction logic confirmed by engulfing bars.
 
-Design notes, from three earlier races on this harness: the dev window
-is only a qualification gate (a bot must finish it above zero after
-fees), and the live window rewards a small number of decisive trades,
-not activity. A full-size round trip costs roughly 26 bps in fee,
-slippage and price impact, so every entry has to be chasing a move
-several times that size, and the position is sized like it matters.
+The idea comes from auction market theory. Over any stretch of tape
+the market auctions price up and down until it finds the band where
+most business gets done: the value area. Bars carry no volume on this
+harness, so the profile here is built from closes instead: a rolling
+histogram of the last 180 closes, its most populated bin the point of
+control, expanded both ways until it holds 70 percent of the closes.
+The edges of that band are the value area high (VAH) and value area
+low (VAL), and they are the only map this bot trades against.
 
-The bot speaks the agent-fun/bars-replay/v1 line protocol: a hello
-message first, then one batch per minute bar, each answered with one
-reply carrying its orders, then done. It keeps no state outside the
-run, reads no clock and no files, and decides only from the bars and
-the account each batch reports, so two runs on the same tape agree
-byte for byte.
+Two things can happen at an edge, and they mean opposite things:
 
-Entry shapes, both long-only, at most one position at a time:
+- The auction fails. Price probes outside the value area, finds no
+  acceptance there, and closes back inside. Only a capitulation
+  probe counts: price must have fallen hard into it, and the snap
+  back must reclaim at least half the value area. A probe below VAL
+  like that is sellers exhausting themselves into a vacuum: nobody
+  wanted to do business down there. That failure is worth buying,
+  but only once a bullish engulfing bar proves buyers have actually
+  taken the bar over: a green body that swallows the prior bar's
+  body whole and closes through its high. A shallow probe in a
+  steady grind down is just the trend continuing, and is left alone.
+- The auction accepts. Closes hold above VAH - three of the last
+  four - so the market is building value higher, and an engulfing
+  bar that clears VAH decisively shows buyers pressing rather than
+  covering. New value is being built higher, and the bot goes with
+  it instead of fading it.
 
-- Washout reclaim. Price has fallen hard over the last 45 bars (or
-  harder over 140) and the current bar turns up with a real body:
-  the fall has stalled and the first buyers are back. This is the
-  capitulation trough the earlier entries hunted, restated tighter.
-- Quiet-base spark. The prior day-part sat in a range under 0.55%
-  and the current bar jumps at least 0.5% to close near its high:
-  a flat tape's one decisive directional move, taken early.
+The harness is long only, so the mirror image of the failed auction
+(a probe above VAH that falls back inside) is information, not a
+trade: it cancels any pending breakout and nothing more.
 
-Risk stack on every trade: a hard stop under the entry, a rebound
-target, a trailing stop once the trade has run, a time stop so no
-position drifts, a long rest between trades, a cap of five round
-trips, and a global halt that flattens everything and stops trading
-if equity falls 3% from its peak.
+Risk discipline is unchanged in spirit from earlier races on this
+harness: one position at a time, sized at 82 percent of cash because
+a full-size round trip costs about 26 bps and only decisive trades
+clear it, a hard stop, a target, a trailing stop once the trade has
+run, a time stop, a long rest between trades, at most five round
+trips, and a global halt that flattens everything if equity falls
+3 percent from its peak. The bot reads only the bars and the account
+in each batch, keeps no state outside the run, and so replays byte
+for byte.
 """
 
 import json
 import sys
 
-FAST = 45            # short washout window, in bars
-SLOW = 140           # long washout window, in bars
-FAST_DROP = 0.012    # 45-bar fall that counts as a washout
-SLOW_DROP = 0.022    # 140-bar fall that counts as a washout
-BOUNCE = 0.003       # rise off the recent low that confirms a reclaim
-BASE_BARS = 24       # quiet-base window for the spark
-BASE_RANGE = 0.0055  # widest range that still counts as quiet
-SPARK_JUMP = 0.006   # one-bar jump that counts as a spark
-SIZE_FRAC = 0.82     # share of cash committed per entry
-STOP_FRAC = 0.0055   # hard stop below the entry price
-TARGET_FRAC = 0.0135  # rebound target above the entry price
-TRAIL_ARM = 0.0075   # gain that arms the trailing stop
-TRAIL_FRAC = 0.0038  # trailing distance below the peak close
-TIME_STOP = 200      # bars after which a held trade is closed
-REST_BARS = 150      # bars rested after any exit
-ENTRY_GAP = 200      # minimum bars between two entries
-MAX_TRADES = 5       # round trips allowed over the whole window
-HALT_DD = 0.03       # equity fall from peak that halts trading
-SLIP_BPS = 200       # max_slippage_bps sent on every order
+VA_LOOKBACK = 180     # closes in the rolling price profile
+VA_COVER = 0.70       # share of closes the value area must hold
+BIN_FRAC = 0.0004     # profile bin width, as a share of price
+MIN_HIST = 200        # bars seen before any entry is allowed
+PROBE_MAX_BARS = 25   # closes below VAL before a probe is acceptance
+PROBE_MAX_DEPTH = 0.016  # probe deeper than this is a repricing
+PROBE_FALL = 0.009    # fall into the probe that makes it capitulation
+CONFIRM_BARS = 2      # bars after re-entry to wait for the engulfing
+ACCEPT_CLEAR = 0.001  # decisive clear of VAH an acceptance entry needs
+CHASE_MAX = 0.008     # never chase acceptance further above VAH
+ENGULF_MIN_BODY = 0.0006  # smallest engulfing body, share of price
+SIZE_FRAC = 0.82      # share of cash committed per entry
+STOP_FRAC = 0.006     # hard stop below the entry price
+TARGET_FRAC = 0.014   # profit target above the entry price
+TRAIL_ARM = 0.008     # gain that arms the trailing stop
+TRAIL_FRAC = 0.004    # trailing distance below the peak close
+TIME_STOP = 200       # bars after which a held trade is closed
+REST_BARS = 150       # bars rested after any exit
+ENTRY_GAP = 200       # minimum bars between two entries
+MAX_TRADES = 5        # round trips allowed over the whole window
+HALT_DD = 0.03        # equity fall from peak that halts trading
+SLIP_BPS = 200        # max_slippage_bps sent on every order
 MIN_NOTIONAL = 1000000  # 1 USDC in quote units
 
 
@@ -63,8 +78,10 @@ class Bot:
         self.price_scale = sym["price_scale"]
         self.qty_scale = sym["qty_scale"]
         self.quote_scale = hello["capital"]["quote_scale"]
-        self.closes = []
         self.opens = []
+        self.highs = []
+        self.lows = []
+        self.closes = []
         self.counter = 0
         self.was_holding = False
         self.entry_px = None
@@ -75,60 +92,91 @@ class Bot:
         self.trades_done = 0
         self.peak_equity = None
         self.halted = False
+        # Failed-auction probe state (downside probes only: the
+        # harness is long only, so an upside probe is not traded).
+        self.probe_low = None
+        self.probe_ref = None
+        self.probe_out = 0
+        self.probe_back_age = None
+        # Acceptance state: True while closes are holding above
+        # VAH (value being built higher), False otherwise.
+        self.accepted = False
 
     def _order_id(self):
         self.counter += 1
-        return "wr-%d" % self.counter
-
-    def _ret(self, n):
-        if len(self.closes) <= n:
-            return None
-        then = self.closes[-1 - n]
-        if then <= 0:
-            return None
-        return self.closes[-1] / then - 1.0
+        return "ae-%d" % self.counter
 
     def _entry_price(self, qty, cost_units):
-        # Average price paid, in price-scale units, from the position's
-        # recorded cost: cost is quote units for qty base units.
+        # Average price paid, in price-scale units, from the
+        # position's recorded cost in quote units.
         return (cost_units * 10 ** (self.qty_scale + self.price_scale)
                 // (qty * 10 ** self.quote_scale))
 
-    def _washout(self, close):
-        fast = self._ret(FAST)
-        slow = self._ret(SLOW)
-        deep = (fast is not None and fast <= -FAST_DROP) \
-            or (slow is not None and slow <= -SLOW_DROP)
-        if not deep:
-            return False
-        # A single up bar inside a slide is a pause, not a trough: the
-        # close must already stand a real bounce above the lowest
-        # close of the last dozen bars before the reclaim is believed.
-        recent_low = min(self.closes[-12:])
-        return recent_low > 0 and close >= recent_low * (1.0 + BOUNCE)
+    def _value_area(self):
+        # The value area of the closes before the current bar: the
+        # contiguous run of price bins around the most populated bin
+        # that together hold VA_COVER of the lookback's closes.
+        if len(self.closes) < VA_LOOKBACK + 1:
+            return None
+        window = self.closes[-1 - VA_LOOKBACK:-1]
+        ref = window[-1]
+        if ref <= 0:
+            return None
+        width = max(1, int(ref * BIN_FRAC))
+        counts = {}
+        for close in window:
+            cell = close // width
+            counts[cell] = counts.get(cell, 0) + 1
+        poc = None
+        for cell in counts:
+            if poc is None or counts[cell] > counts[poc]:
+                poc = cell
+        lo = poc
+        hi = poc
+        covered = counts[poc]
+        goal = VA_COVER * len(window)
+        while covered < goal:
+            up = counts.get(hi + 1, 0)
+            down = counts.get(lo - 1, 0)
+            if up == 0 and down == 0:
+                break
+            if up >= down:
+                hi += 1
+                covered += up
+            else:
+                lo -= 1
+                covered += down
+        return lo * width, (hi + 1) * width
 
-    def _spark(self, high, low, close):
-        if len(self.closes) <= BASE_BARS:
+    def _bull_engulf(self, bar_idx):
+        # True when the bar at bar_idx is a bullish engulfing bar
+        # against its predecessor: a green body at least as wide as
+        # the prior bar's body on both sides, a body with real size,
+        # and a close through the prior bar's high.
+        if bar_idx < 1:
             return False
-        prior = self.closes[-1 - BASE_BARS:-1]
-        top = max(prior)
-        bottom = min(prior)
-        if bottom <= 0 or (top - bottom) / bottom > BASE_RANGE:
+        o = self.opens[bar_idx]
+        c = self.closes[bar_idx]
+        if c <= o:
             return False
-        prev = self.closes[-2]
-        if prev <= 0 or close / prev - 1.0 < SPARK_JUMP:
+        if c - o < c * ENGULF_MIN_BODY:
             return False
-        if high <= low:
+        po = self.opens[bar_idx - 1]
+        pc = self.closes[bar_idx - 1]
+        if o > min(po, pc):
             return False
-        # A true breakout closes through the base's top, not just
-        # near its own bar high.
-        return close > top and close >= low + 0.85 * (high - low)
+        return c > self.highs[bar_idx - 1]
 
     def _enter(self, cash):
         notional = cash * int(SIZE_FRAC * 10000) // 10000
         if notional < MIN_NOTIONAL:
             return []
         self.last_entry_bar = len(self.closes)
+        self.probe_low = None
+        self.probe_ref = None
+        self.probe_out = 0
+        self.probe_back_age = None
+        self.accepted = False
         return [{"side": "buy", "client_id": self._order_id(),
                  "symbol": self.symbol,
                  "notional_quote_units": str(notional),
@@ -138,6 +186,87 @@ class Bot:
         return [{"side": "sell", "client_id": self._order_id(),
                  "symbol": self.symbol, "qty": str(qty),
                  "max_slippage_bps": SLIP_BPS}]
+
+    def _flat_decision(self, cash, now):
+        # Entry logic, run only when no position is held. Updates the
+        # probe and breakout state from the bar just appended and
+        # returns an entry order list or nothing.
+        if self.trades_done >= MAX_TRADES:
+            return []
+        if now < self.rest_until or now - self.last_entry_bar < ENTRY_GAP:
+            return []
+        if len(self.closes) < MIN_HIST:
+            return []
+        area = self._value_area()
+        if area is None:
+            return []
+        val, vah = area
+        idx = len(self.closes) - 1
+        close = self.closes[idx]
+        low = self.lows[idx]
+
+        # --- failed auction: a downside probe that came back ------
+        # Only capitulation probes count: price must have fallen at
+        # least PROBE_FALL into the probe from the closes before it,
+        # and the confirming engulfing bar must close at least
+        # halfway back through the value area. A shallow probe in a
+        # grind down is the trend continuing, not an auction failing.
+        if self.probe_low is None:
+            if low < val:
+                self.probe_low = low
+                self.probe_ref = max(self.closes[-61:-1])
+                self.probe_out = 1 if close < val else 0
+                self.probe_back_age = None
+        elif self.probe_back_age is None:
+            if low < self.probe_low:
+                self.probe_low = low
+            if val - self.probe_low > val * PROBE_MAX_DEPTH:
+                self.probe_low = None
+                self.probe_ref = None
+                self.probe_out = 0
+            elif close < val:
+                self.probe_out += 1
+                if self.probe_out > PROBE_MAX_BARS:
+                    self.probe_low = None
+                    self.probe_ref = None
+                    self.probe_out = 0
+            elif close >= val:
+                self.probe_back_age = 0
+        else:
+            self.probe_back_age += 1
+            if self.probe_back_age > CONFIRM_BARS:
+                self.probe_low = None
+                self.probe_ref = None
+                self.probe_out = 0
+                self.probe_back_age = None
+        if self.probe_low is not None and self.probe_back_age is not None:
+            fell = self.probe_ref is not None \
+                and self.probe_low <= self.probe_ref * (1.0 - PROBE_FALL)
+            reclaimed = close >= (val + vah) // 2
+            if fell and reclaimed and self._bull_engulf(idx):
+                return self._enter(cash)
+
+        # --- acceptance: closes holding above VAH -----------------
+        # Acceptance is a state, not a single bar: once at least
+        # three of the last four closes sit above VAH the market is
+        # building value higher, and it stays accepted until a close
+        # falls back inside. An engulfing bar that clears VAH
+        # decisively (but is not yet a chase) is the entry.
+        recent = self.closes[-4:]
+        above = 0
+        for past in recent:
+            if past > vah:
+                above += 1
+        if close < vah:
+            self.accepted = False
+        elif above >= 3:
+            self.accepted = True
+        if self.accepted \
+                and vah * (1.0 + ACCEPT_CLEAR) <= close \
+                <= vah * (1.0 + CHASE_MAX) \
+                and self._bull_engulf(idx):
+            return self._enter(cash)
+        return []
 
     def on_batch(self, batch):
         account = batch["account"]
@@ -154,12 +283,12 @@ class Bot:
         if bar is None:
             return []
 
-        close = int(bar["c"])
-        high = int(bar["h"])
-        low = int(bar["l"])
-        self.closes.append(close)
         self.opens.append(int(bar["o"]))
+        self.highs.append(int(bar["h"]))
+        self.lows.append(int(bar["l"]))
+        self.closes.append(int(bar["c"]))
         now = len(self.closes)
+        close = self.closes[-1]
 
         if self.peak_equity is None or equity > self.peak_equity:
             self.peak_equity = equity
@@ -206,19 +335,7 @@ class Bot:
                 return self._leave(qty)
             return []
 
-        if self.trades_done >= MAX_TRADES:
-            return []
-        if now < self.rest_until or now - self.last_entry_bar < ENTRY_GAP:
-            return []
-        if len(self.closes) < 3:
-            return []
-        prev_close = self.closes[-2]
-        turned_up = close > prev_close and close > int(bar["o"])
-        if turned_up and self._washout(close):
-            return self._enter(cash)
-        if self._spark(high, low, close):
-            return self._enter(cash)
-        return []
+        return self._flat_decision(cash, now)
 
 
 def main():
